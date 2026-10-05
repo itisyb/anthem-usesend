@@ -49,6 +49,9 @@ ENV NEXT_PUBLIC_GIT_SHA=$GIT_SHA
 COPY --from=builder /app/out/full/ .
 
 RUN pnpm turbo run build --filter=web...
+COPY ./docker/copy-prisma-runtime.cjs ./copy-prisma-runtime.cjs
+RUN node copy-prisma-runtime.cjs ./apps/web/node_modules/prisma /prisma-runtime
+RUN node /prisma-runtime/node_modules/prisma/build/index.js --version
 
 FROM base AS runner
 WORKDIR /app
@@ -67,11 +70,10 @@ COPY --from=installer  /app/apps/web/public ./apps/web/public
 # Copy prisma files
 COPY --from=installer  /app/apps/web/prisma/schema.prisma ./apps/web/prisma/schema.prisma
 COPY --from=installer  /app/apps/web/prisma/migrations ./apps/web/prisma/migrations
-COPY --from=installer  /app/apps/web/node_modules/prisma ./node_modules/prisma
-COPY --from=installer  /app/apps/web/node_modules/@prisma ./node_modules/@prisma
+COPY --from=installer /prisma-runtime/node_modules ./node_modules
 
 # Symlink the prisma binary
-RUN mkdir node_modules/.bin
+RUN mkdir -p node_modules/.bin
 RUN ln -s /app/node_modules/prisma/build/index.js ./node_modules/.bin/prisma
 
 # set this so it throws error where starting server
