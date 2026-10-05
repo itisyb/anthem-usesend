@@ -44,9 +44,10 @@ async function getIdentityArn(domain: string, region: string) {
   return `arn:aws:ses:${region}:${accountId}:identity/${domain}`;
 }
 
-function getSesClient(region: string) {
+function getSesClient(region: string, maxAttempts?: number) {
   return new SESv2Client({
     region: region,
+    ...(maxAttempts === undefined ? {} : { maxAttempts }),
     endpoint: env.AWS_SES_ENDPOINT,
     ...getAwsCredentialOptions(),
   });
@@ -82,7 +83,7 @@ export async function addDomain(
   domain: string,
   region: string,
   sesTenantId?: string,
-  dkimSelector: string = "usesend"
+  dkimSelector: string = "usesend",
 ) {
   const sesClient = getSesClient(region);
 
@@ -111,13 +112,13 @@ export async function addDomain(
       });
 
     const tenantResourceAssociationResponse = await sesClient.send(
-      tenantResourceAssociationCommand
+      tenantResourceAssociationCommand,
     );
 
     if (tenantResourceAssociationResponse.$metadata.httpStatusCode !== 200) {
       logger.error(
         { tenantResourceAssociationResponse },
-        "Failed to associate domain with tenant"
+        "Failed to associate domain with tenant",
       );
       throw new Error("Failed to associate domain with tenant");
     }
@@ -129,7 +130,7 @@ export async function addDomain(
   ) {
     logger.error(
       { response, emailIdentityResponse },
-      "Failed to create domain identity"
+      "Failed to create domain identity",
     );
     throw new Error("Failed to create domain identity");
   }
@@ -140,7 +141,7 @@ export async function addDomain(
 export async function deleteDomain(
   domain: string,
   region: string,
-  sesTenantId?: string
+  sesTenantId?: string,
 ) {
   const sesClient = getSesClient(region);
 
@@ -152,13 +153,13 @@ export async function deleteDomain(
       });
 
     const tenantResourceAssociationResponse = await sesClient.send(
-      tenantResourceAssociationCommand
+      tenantResourceAssociationCommand,
     );
 
     if (tenantResourceAssociationResponse.$metadata.httpStatusCode !== 200) {
       logger.error(
         { tenantResourceAssociationResponse },
-        "Failed to delete tenant resource association"
+        "Failed to delete tenant resource association",
       );
       throw new Error("Failed to delete tenant resource association");
     }
@@ -211,7 +212,8 @@ export async function sendRawEmail({
   inReplyToMessageId?: string;
   emailId?: string;
 }) {
-  const sesClient = getSesClient(region);
+  // Only the worker retries explicit throttling; SES sends have no idempotency token.
+  const sesClient = getSesClient(region, 1);
 
   const { message: messageStream } = await nodemailer
     .createTransport({ streamTransport: true })
@@ -277,7 +279,7 @@ export async function addWebhookConfiguration(
   configName: string,
   topicArn: string,
   eventTypes: EventType[],
-  region: string
+  region: string,
 ) {
   const sesClient = getSesClient(region);
 
@@ -313,7 +315,7 @@ export async function addWebhookConfiguration(
  */
 export async function deleteFromSesSuppressionList(
   email: string,
-  region: string
+  region: string,
 ): Promise<boolean> {
   const sesClient = getSesClient(region);
   try {
@@ -328,13 +330,13 @@ export async function deleteFromSesSuppressionList(
     if (error.name === "NotFoundException") {
       logger.debug(
         { email, region },
-        "Email not in SES suppression list (already removed or never added)"
+        "Email not in SES suppression list (already removed or never added)",
       );
       return true;
     }
     logger.error(
       { email, region, error: error.message },
-      "Failed to remove email from SES suppression list"
+      "Failed to remove email from SES suppression list",
     );
     return false;
   }

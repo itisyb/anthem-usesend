@@ -240,6 +240,22 @@ enum EmailStatus {
   SUPPRESSED
 }
 
+// A durable request fence prevents an API timeout or Redis restart from
+// creating a second email for the same client idempotency key.
+model EmailRequest {
+  id        String   @id @default(cuid())
+  teamId    Int
+  keyHash   String
+  bodyHash  String
+  status    String   @default("PROCESSING")
+  emailIds  String[] @default([])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  emails    Email[]
+
+  @@unique([teamId, keyHash])
+}
+
 model Email {
   id           String       @id @default(cuid())
   sesEmailId   String?      @unique
@@ -263,11 +279,14 @@ model Email {
   contactId    String?
   inReplyToId  String?
   headers      String?
+  requestId    String?
+  request      EmailRequest? @relation(fields: [requestId], references: [id])
   team         Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
   emailEvents  EmailEvent[]
 
   @@index([campaignId, contactId])
   @@index([createdAt(sort: Desc)])
+  @@index([requestId])
 }
 
 model CampaignEmail {

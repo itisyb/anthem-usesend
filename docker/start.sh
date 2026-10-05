@@ -1,12 +1,12 @@
 #!/bin/sh
+set -eu
 
-set -x
+# Schema changes are an explicit release operation. Use the Prisma version
+# installed in this image; do not download another version at startup.
+if [ "${RUN_DATABASE_MIGRATIONS:-false}" = "true" ]; then
+  node node_modules/prisma/build/index.js migrate deploy --schema ./apps/web/prisma/schema.prisma
+else
+  node node_modules/prisma/build/index.js migrate status --schema ./apps/web/prisma/schema.prisma
+fi
 
-echo "Deploying prisma migrations"
-
-pnpx prisma@6.6.0  migrate deploy --schema ./apps/web/prisma/schema.prisma
-
-echo "Starting web server"
-
-node apps/web/server.js
-
+exec node apps/web/server.js

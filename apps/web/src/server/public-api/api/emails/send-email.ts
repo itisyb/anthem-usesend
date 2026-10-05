@@ -16,13 +16,13 @@ const route = createRoute({
           .max(256)
           .optional()
           .openapi({
-            description: `Pass the optional Idempotency-Key header to make the request safe to retry. The key can be up to 256 characters. The server stores the canonical request body and behaves as follows:
+            description: `Pass the optional Idempotency-Key header to make the request safe to retry. The key can be up to 256 characters. The server stores a hash of the canonical request body and behaves as follows:
 
 - Same key + same request body → returns the original emailId with 200 OK without re-sending.
 - Same key + different request body → returns 409 Conflict with code: NOT_UNIQUE so you can detect the mismatch.
-- Same key while another request is still being processed → returns 409 Conflict; retry after a short delay or once the first request completes.
+- Same key while another request is still being processed → returns 409 Conflict; retry with the same key after the first request completes. An interrupted request requires operator reconciliation.
 
-Entries expire after 24 hours. Use a unique key per logical send (for example, an order or signup ID).`,
+Anthem retains the PostgreSQL request fence until explicitly reconciled or removed under the retention policy. Use a unique key per logical send; never use a new key to bypass an uncertain outcome.`,
           }),
       })
       .partial(),
@@ -73,11 +73,12 @@ function send(app: PublicAPIApp) {
       teamId: team.id,
       idemKey,
       payload: clientPayload,
-      operation: async () => {
+      operation: async (requestId) => {
         const email = await sendEmail({
           ...clientPayload,
           teamId: team.id,
           apiKeyId: team.apiKeyId,
+          requestId,
         });
         return { emailId: email?.id };
       },

@@ -4,7 +4,22 @@ import { getRedis } from "~/server/redis";
 
 export const integrationEnabled = process.env.RUN_INTEGRATION === "true";
 
+function requireLocalTestDatabase(kind: "DATABASE_URL" | "REDIS_URL") {
+  const url = new URL(process.env[kind] ?? "");
+  if (
+    !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ||
+    (kind === "DATABASE_URL"
+      ? !url.pathname.endsWith("_test")
+      : url.pathname !== "/15")
+  ) {
+    throw new Error(
+      `Refusing destructive test reset outside a local test database: ${kind}`,
+    );
+  }
+}
+
 export async function resetDatabase() {
+  requireLocalTestDatabase("DATABASE_URL");
   const rows = await db.$queryRaw<Array<{ tablename: string }>>(Prisma.sql`
     SELECT tablename
     FROM pg_tables
@@ -24,6 +39,7 @@ export async function resetDatabase() {
 }
 
 export async function resetRedis() {
+  requireLocalTestDatabase("REDIS_URL");
   await getRedis().flushdb();
 }
 

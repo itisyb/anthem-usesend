@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { Prisma } from "@prisma/client";
+import { db } from "../db";
 import { getRedis, redisKey } from "~/server/redis";
 import { canonicalizePayload } from "~/server/utils/idempotency";
 import { UnsendApiError } from "~/server/public-api/api-error";
@@ -15,7 +18,7 @@ export type IdempotencyHandlerOptions<TPayload, TResult> = {
   teamId: number;
   idemKey: string | undefined;
   payload: TPayload;
-  operation: () => Promise<TResult>;
+  operation: (requestId?: string) => Promise<TResult>;
   extractEmailIds: (result: TResult) => string[];
   formatCachedResponse: (emailIds: string[]) => TResult;
   logContext: string;
@@ -109,64 +112,98 @@ export const IdempotencyService = {
       return await operation();
     }
 
-    // Calculate payload hash
     const { bodyHash: payloadHash } = canonicalizePayload(payload);
-
-    // Check for existing result
-    const existing = await this.getResult(teamId, idemKey);
-    if (existing) {
-      if (existing.bodyHash === payloadHash) {
-        logger.info({ teamId }, `Idempotency hit for ${logContext}`);
-        return formatCachedResponse(existing.emailIds);
-      }
-
-      throw new UnsendApiError({
-        code: "NOT_UNIQUE",
-        message: "Idempotency-Key already used with a different payload",
-      });
-    }
-
-    // Try to acquire lock
-    const lockAcquired = await this.acquireLock(teamId, idemKey);
-    if (!lockAcquired) {
-      // Check again in case another request completed
-      const again = await this.getResult(teamId, idemKey);
-      if (again) {
-        if (again.bodyHash === payloadHash) {
-          logger.info(
-            { teamId },
-            `Idempotency hit after contention for ${logContext}`,
-          );
-          return formatCachedResponse(again.emailIds);
-        }
-
+    const keyHash = createHash("sha256").update(idemKey).digest("hex");
+    const where = { teamId_keyHash: { teamId, keyHash } };
+    const replay = (record: {
+      bodyHash: string;
+      status: string;
+      emailIds: string[];
+    }): TResult => {
+      if (record.bodyHash !== payloadHash)
         throw new UnsendApiError({
           code: "NOT_UNIQUE",
           message: "Idempotency-Key already used with a different payload",
         });
-      }
+      if (record.status !== "COMPLETED")
+        throw new UnsendApiError({
+          code: "NOT_UNIQUE",
+          message:
+            "Request is in progress or its outcome needs reconciliation. Do not resend with a new key.",
+        });
+      return formatCachedResponse(record.emailIds);
+    };
+    const existing = await db.emailRequest.findUnique({ where });
+    if (existing) return replay(existing);
 
+    // Honor pre-fork results during the 24-hour cutover window. Redis failure
+    // fails closed here, before any side effect, rather than risking a duplicate.
+    const legacy = await this.getResult(teamId, idemKey);
+    if (legacy) {
+      const record = await db.emailRequest.upsert({
+        where,
+        create: {
+          teamId,
+          keyHash,
+          bodyHash: legacy.bodyHash,
+          emailIds: legacy.emailIds,
+          status: "COMPLETED",
+        },
+        update: {},
+      });
+      return replay(record);
+    }
+    const redis = getRedis();
+    if (await redis.exists(lockKey(teamId, idemKey)))
       throw new UnsendApiError({
         code: "NOT_UNIQUE",
         message:
-          "Request with same Idempotency-Key is in progress. Retry later.",
+          "A pre-cutover request is still in progress. Retry with the same key later.",
       });
-    }
 
+    let request;
     try {
-      // Execute the operation
-      const result = await operation();
-
-      // Store the result for future idempotency checks
+      request = await db.emailRequest.create({
+        data: { teamId, keyHash, bodyHash: payloadHash, emailIds: [] },
+      });
+    } catch (error) {
+      if (
+        !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+        error.code !== "P2002"
+      )
+        throw error;
+      return replay(await db.emailRequest.findUniqueOrThrow({ where }));
+    }
+    // Never remove this fence on an exception: the provider/queue may already
+    // have accepted work. Linked Email rows give operators exact evidence.
+    try {
+      const result = await operation(request.id);
+      await db.emailRequest.update({
+        where: { id: request.id },
+        data: { status: "COMPLETED", emailIds: extractEmailIds(result) },
+      });
+      // Keep old-version results warm for a controlled rollback. PostgreSQL is
+      // authoritative; losing this cache write must not repeat a completed send.
       await this.setResult(teamId, idemKey, {
         bodyHash: payloadHash,
         emailIds: extractEmailIds(result),
+      }).catch((error) => {
+        logger.error(
+          { err: error, requestId: request.id },
+          "Legacy idempotency cache was not updated",
+        );
       });
-
       return result;
-    } finally {
-      // Always release the lock
-      await this.releaseLock(teamId, idemKey);
+    } catch (error) {
+      await db.emailRequest
+        .update({ where: { id: request.id }, data: { status: "RECONCILE" } })
+        .catch((persistError) => {
+          logger.error(
+            { err: persistError, requestId: request.id },
+            "Email request remains fenced after a failed completion write",
+          );
+        });
+      throw error;
     }
   },
 };
