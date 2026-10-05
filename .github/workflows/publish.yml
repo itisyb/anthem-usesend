@@ -40,3 +40,9 @@ jobs:
           IMAGE: ${{ steps.image.outputs.name }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "Deploy $IMAGE at digest $DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test the published image with disposable services
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: sh docker/smoke-staging.sh
