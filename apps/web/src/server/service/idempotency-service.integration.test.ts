@@ -7,6 +7,7 @@ import {
   closeIntegrationConnections,
   integrationEnabled,
   resetRedis,
+  resetDatabase,
 } from "~/test/integration/helpers";
 
 const describeIntegration = integrationEnabled ? describe : describe.skip;
@@ -14,6 +15,7 @@ const describeIntegration = integrationEnabled ? describe : describe.skip;
 describeIntegration("idempotency redis integration", () => {
   beforeEach(async () => {
     await resetRedis();
+    await resetDatabase();
   });
 
   afterAll(async () => {

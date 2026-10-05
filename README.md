@@ -1,3 +1,11 @@
+# Anthem useSend
+
+Anthem's maintained fork of [useSend](https://github.com/usesend/useSend), based on upstream commit `bcf7e07e92b11f00fade54ff9a636ca7b5416b0c`.
+
+This fork adds recipient-aware SES rate limits, durable dispatch and API idempotency records, authenticated SNS callbacks, and explicit migration/release controls. See [the release runbook](docs/anthem-email-control.md) for scope, verification, activation, and rollback. Inbound replies continue to use the configured mailbox; a shared Cherry inbox is not part of this release.
+
+Upstream attribution and AGPL licensing are retained below.
+
 <p align="center">
   <img style="width: 200px;height: 200px; margin: auto;" src="https://usesend.com/logo-squircle.png" alt="useSend Logo">
 </p>

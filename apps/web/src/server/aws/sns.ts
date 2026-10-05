@@ -3,6 +3,7 @@ import {
   CreateTopicCommand,
   SubscribeCommand,
   DeleteTopicCommand,
+  ConfirmSubscriptionCommand,
 } from "@aws-sdk/client-sns";
 import { env } from "~/env";
 import { getAwsCredentialOptions } from "~/server/aws/credentials";
@@ -13,6 +14,16 @@ function getSnsClient(region: string) {
     region: region,
     ...getAwsCredentialOptions(),
   });
+}
+
+export async function confirmSubscription(
+  topicArn: string,
+  token: string,
+  region: string,
+) {
+  await getSnsClient(region).send(
+    new ConfirmSubscriptionCommand({ TopicArn: topicArn, Token: token }),
+  );
 }
 
 export async function createTopic(topic: string, region: string) {
@@ -33,7 +44,7 @@ export async function deleteTopic(topicArn: string, region: string) {
 export async function subscribeEndpoint(
   topicArn: string,
   endpointUrl: string,
-  region: string
+  region: string,
 ) {
   const subscribeCommand = new SubscribeCommand({
     Protocol: "https",

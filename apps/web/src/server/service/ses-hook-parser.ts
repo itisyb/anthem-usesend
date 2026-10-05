@@ -90,7 +90,7 @@ export async function parseSesHook(data: SesEvent) {
   });
 
   if (!email) {
-    logger.error({ data }, "Email not found");
+    logger.error({ sesEmailId, eventType: data.eventType }, "Email not found");
     return false;
   }
 
@@ -117,7 +117,7 @@ export async function parseSesHook(data: SesEvent) {
   await db.$executeRaw`
       UPDATE "Email"
       SET "latestStatus" = CASE
-        WHEN ${mailStatus}::text::\"EmailStatus\" > "latestStatus" OR "latestStatus" IS NULL OR "latestStatus" = 'SCHEDULED'::\"EmailStatus\"
+        WHEN ${mailStatus}::text::\"EmailStatus\" > "latestStatus" OR "latestStatus" IS NULL OR "latestStatus" IN ('SCHEDULED'::\"EmailStatus\", 'FAILED'::\"EmailStatus\")
         THEN ${mailStatus}::text::\"EmailStatus\"
         ELSE "latestStatus"
       END
@@ -313,11 +313,21 @@ export async function parseSesHook(data: SesEvent) {
   logger.info("Email event created");
 
   try {
-    const occurredAt = data.mail.timestamp
-      ? new Date(data.mail.timestamp).toISOString()
+    const eventTimestamp =
+      (mailData as { timestamp?: string })?.timestamp ?? data.mail.timestamp;
+    const occurredAt = eventTimestamp
+      ? new Date(eventTimestamp).toISOString()
       : new Date().toISOString();
 
-    const metadata = buildEmailMetadata(mailStatus, mailData);
+    const dispatchKey = data.mail.headers.find(
+      (header) => header.name.toLowerCase() === "x-anthem-dispatch-key",
+    )?.value;
+    const metadata = {
+      ...buildEmailMetadata(mailStatus, mailData),
+      ...(dispatchKey && /^[a-f0-9]{64}$/.test(dispatchKey)
+        ? { anthemDispatchKey: dispatchKey }
+        : {}),
+    };
 
     await WebhookService.emit(
       email.teamId,
@@ -412,8 +422,7 @@ function normalizeBounceSubType(
   subType: SesBounce["bounceSubType"] | undefined,
 ): EmailBounceSubType {
   const normalized = subType?.replace(/\s+/g, "") as
-    | EmailBounceSubType
-    | undefined;
+    EmailBounceSubType | undefined;
 
   const validSubTypes: EmailBounceSubType[] = [
     "General",
@@ -667,10 +676,12 @@ export class SesHookParser {
   }
 
   static async queue(data: { event: SesEvent; messageId: string }) {
-    return await this.sesHookQueue.add(
-      data.messageId,
-      data.event,
-      DEFAULT_QUEUE_OPTIONS,
-    );
+    return await this.sesHookQueue.add(data.messageId, data.event, {
+      ...DEFAULT_QUEUE_OPTIONS,
+      jobId: data.messageId,
+      attempts: 12,
+      backoff: { type: "exponential", delay: 1000 },
+      removeOnComplete: { age: 30 * 24 * 3600 },
+    });
   }
 }

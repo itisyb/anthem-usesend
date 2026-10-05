@@ -150,6 +150,27 @@ describe("parseSesHook dashboard engagement usage", () => {
     mockWebhookEmit.mockResolvedValue(undefined);
   });
 
+  it("uses the event timestamp and forwards opaque application correlation", async () => {
+    const event = buildEvent("Open");
+    event.open!.timestamp = "2026-07-13T02:00:00.000Z";
+    event.mail.headers.push({
+      name: "X-Anthem-Dispatch-Key",
+      value: "a".repeat(64),
+    });
+    await parseSesHook(event);
+    expect(mockWebhookEmit).toHaveBeenCalledWith(
+      7,
+      "email.opened",
+      expect.objectContaining({
+        occurredAt: "2026-07-13T02:00:00.000Z",
+        metadata: expect.objectContaining({
+          anthemDispatchKey: "a".repeat(64),
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
   it.each([
     ["Open", EmailStatus.OPENED],
     ["Click", EmailStatus.CLICKED],

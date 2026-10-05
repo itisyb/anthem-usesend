@@ -1,16 +1,34 @@
 name: Web Tests
 
 on:
+  workflow_dispatch:
+    inputs:
+      database_integration:
+        description: "Explicitly apply migrations to disposable CI Postgres and run integration tests"
+        type: boolean
+        default: false
+      publish_image:
+        description: "Build and publish the commit-tagged staging image after tests pass"
+        type: boolean
+        default: false
   pull_request:
     paths:
       - "apps/web/**"
   push:
     branches:
       - main
+      - dev
     paths:
       - "apps/web/**"
 
 jobs:
+  image:
+    if: github.event_name == 'workflow_dispatch' && inputs.database_integration && inputs.publish_image
+    needs: web-tests
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yml
   web-tests:
     runs-on: ubuntu-latest
     env:
@@ -25,7 +43,7 @@ jobs:
       NEXT_PUBLIC_IS_CLOUD: "true"
       API_RATE_LIMIT: "2"
       AUTH_EMAIL_RATE_LIMIT: "5"
-      RUN_INTEGRATION: "true"
+      RUN_INTEGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.database_integration && 'true' || 'false' }}
     services:
       postgres:
         image: postgres:16
@@ -44,6 +62,7 @@ jobs:
         image: redis:7
         ports:
           - 6379:6379
+          - 16379:6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -74,6 +93,7 @@ jobs:
         run: pnpm --filter=web typecheck
 
       - name: Prepare test database schema
+        if: github.event_name == 'workflow_dispatch' && inputs.database_integration
         run: pnpm --filter=web test:integration:prepare
 
       - name: Run unit tests
@@ -86,4 +106,10 @@ jobs:
         run: pnpm --filter=web test:api
 
       - name: Run integration tests
+        if: github.event_name == 'workflow_dispatch' && inputs.database_integration
         run: pnpm --filter=web test:integration
+
+      - name: Test the recipient budget against real Redis
+        env:
+          RUN_EMAIL_REDIS_TESTS: "true"
+        run: pnpm --filter=web exec vitest run -c vitest.config.ts src/server/service/ses-send-budget.integration.test.ts

@@ -12,6 +12,7 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   release:
+    if: github.repository == 'usesend/useSend'
     runs-on: ubuntu-latest
     defaults:
       run:

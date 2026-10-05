@@ -1,4 +1,4 @@
-import { Queue, Worker } from "bullmq";
+import { DelayedError, Queue, UnrecoverableError, Worker } from "bullmq";
 import { env } from "~/env";
 import { EmailAttachment } from "~/types";
 import { convert as htmlToText } from "html-to-text";
@@ -10,6 +10,16 @@ import { DEFAULT_QUEUE_OPTIONS } from "../queue/queue-constants";
 import { logger } from "../logger/log";
 import { createWorkerHandler, TeamJob } from "../queue/bullmq-context";
 import { LimitService } from "./limit-service";
+import { reserveSendBudget, isExplicitSesThrottle } from "./ses-send-budget";
+import { claimDispatch } from "./email-dispatch";
+import { WebhookService } from "./webhook-service";
+
+const SEND_ATTEMPTS = 6;
+const SEND_QUEUE_OPTIONS = {
+  ...DEFAULT_QUEUE_OPTIONS,
+  attempts: SEND_ATTEMPTS,
+  backoff: { type: "exponential", delay: 1000 },
+};
 import {
   BUILT_IN_CONTACT_VARIABLES,
   replaceContactVariables,
@@ -28,7 +38,11 @@ function createQueueAndWorker(region: string, quota: number, suffix: string) {
 
   const queueName = `${region}-${suffix}`;
 
-  const queue = new Queue(queueName, { connection, prefix: BULL_PREFIX, skipVersionCheck: true });
+  const queue = new Queue(queueName, {
+    connection,
+    prefix: BULL_PREFIX,
+    skipVersionCheck: true,
+  });
 
   // TODO: Add team context to job data when queueing
   const worker = new Worker(queueName, createWorkerHandler(executeEmail), {
@@ -51,22 +65,22 @@ export class EmailQueueService {
   public static initializeQueue(
     region: string,
     quota: number,
-    transactionalQuotaPercentage: number
+    transactionalQuotaPercentage: number,
   ) {
     logger.info(
       { region },
-      `[EmailQueueService]: Initializing queue for region`
+      `[EmailQueueService]: Initializing queue for region`,
     );
 
     const transactionalQuota = Math.floor(
-      (quota * transactionalQuotaPercentage) / 100
+      (quota * transactionalQuotaPercentage) / 100,
     );
     const marketingQuota = quota - transactionalQuota;
 
     if (this.transactionalQueue.has(region)) {
       logger.info(
         { region, transactionalQuota },
-        `[EmailQueueService]: Updating transactional quota for region`
+        `[EmailQueueService]: Updating transactional quota for region`,
       );
       const transactionalWorker = this.transactionalWorker.get(region);
       if (transactionalWorker) {
@@ -76,13 +90,13 @@ export class EmailQueueService {
     } else {
       logger.info(
         { region, transactionalQuota },
-        `[EmailQueueService]: Creating transactional queue for region`
+        `[EmailQueueService]: Creating transactional queue for region`,
       );
       const { queue: transactionalQueue, worker: transactionalWorker } =
         createQueueAndWorker(
           region,
           transactionalQuota !== 0 ? transactionalQuota : 1,
-          "transaction"
+          "transaction",
         );
       this.transactionalQueue.set(region, transactionalQueue);
       this.transactionalWorker.set(region, transactionalWorker);
@@ -91,7 +105,7 @@ export class EmailQueueService {
     if (this.marketingQueue.has(region)) {
       logger.info(
         { region, marketingQuota },
-        `[EmailQueueService]: Updating marketing quota for region`
+        `[EmailQueueService]: Updating marketing quota for region`,
       );
       const marketingWorker = this.marketingWorker.get(region);
       if (marketingWorker) {
@@ -100,13 +114,13 @@ export class EmailQueueService {
     } else {
       logger.info(
         { region, marketingQuota },
-        `[EmailQueueService]: Creating marketing queue for region`
+        `[EmailQueueService]: Creating marketing queue for region`,
       );
       const { queue: marketingQueue, worker: marketingWorker } =
         createQueueAndWorker(
           region,
           marketingQuota !== 0 ? marketingQuota : 1,
-          "marketing"
+          "marketing",
         );
       this.marketingQueue.set(region, marketingQueue);
       this.marketingWorker.set(region, marketingWorker);
@@ -119,7 +133,7 @@ export class EmailQueueService {
     region: string,
     transactional: boolean,
     unsubUrl?: string,
-    delay?: number
+    delay?: number,
   ) {
     if (!this.initialized) {
       await this.init();
@@ -140,7 +154,7 @@ export class EmailQueueService {
         isBulk,
         teamId,
       },
-      { jobId: emailId, delay, ...DEFAULT_QUEUE_OPTIONS }
+      { jobId: emailId, delay, ...SEND_QUEUE_OPTIONS },
     );
   }
 
@@ -160,7 +174,7 @@ export class EmailQueueService {
       unsubUrl?: string;
       delay?: number;
       timestamp?: number; // Optional: pass timestamp if needed for data
-    }[]
+    }[],
   ): Promise<void> {
     if (jobs.length === 0) {
       logger.info("[EmailQueueService]: No jobs provided for bulk queue.");
@@ -173,7 +187,7 @@ export class EmailQueueService {
 
     logger.info(
       { count: jobs.length },
-      `[EmailQueueService]: Starting bulk queue for jobs.`
+      `[EmailQueueService]: Starting bulk queue for jobs.`,
     );
 
     // Group jobs by region and type
@@ -201,20 +215,24 @@ export class EmailQueueService {
           transactional: boolean;
           jobDetails: typeof jobs;
         }
-      >
+      >,
     );
 
     const bulkAddPromises: Promise<any>[] = [];
+
+    // Validate all destinations before starting any asynchronous queue write.
+    for (const [groupKey, group] of Object.entries(groupedJobs)) {
+      if (!group.queue) throw new Error(`Queue unavailable for ${groupKey}`);
+    }
 
     for (const groupKey in groupedJobs) {
       const group = groupedJobs[groupKey];
       if (!group || !group.queue) {
         logger.error(
           { groupKey, count: group?.jobDetails?.length ?? 0 },
-          `[EmailQueueService]: Queue not found for group during bulk add. Skipping jobs.`
+          `[EmailQueueService]: Queue not found for group during bulk add. Skipping jobs.`,
         );
-        // Optionally: handle these skipped jobs (e.g., mark corresponding emails as failed)
-        continue;
+        throw new Error(`Queue unavailable for ${groupKey}`);
       }
 
       const queue = group.queue;
@@ -231,28 +249,33 @@ export class EmailQueueService {
         opts: {
           jobId: job.emailId, // Use emailId as jobId
           delay: job.delay,
-          ...DEFAULT_QUEUE_OPTIONS, // Apply default options (attempts, backoff)
+          ...SEND_QUEUE_OPTIONS, // Apply default options (attempts, backoff)
         },
       }));
 
       logger.info(
         { count: bulkData.length, queue: queue.name },
-        `[EmailQueueService]: Adding jobs to queue`
+        `[EmailQueueService]: Adding jobs to queue`,
       );
       bulkAddPromises.push(
         queue.addBulk(bulkData).catch((error) => {
           logger.error(
             { err: error, queue: queue.name },
-            `[EmailQueueService]: Failed to add bulk jobs to queue`
+            `[EmailQueueService]: Failed to add bulk jobs to queue`,
           );
-          // Optionally: handle bulk add failure (e.g., mark corresponding emails as failed)
-        })
+          throw error;
+        }),
       );
     }
 
-    await Promise.allSettled(bulkAddPromises);
+    const results = await Promise.allSettled(bulkAddPromises);
+    if (results.some((result) => result.status === "rejected")) {
+      throw new Error(
+        "One or more email queue writes failed; reconcile the created email IDs before retrying",
+      );
+    }
     logger.info(
-      "[EmailQueueService]: Finished processing bulk queue requests."
+      "[EmailQueueService]: Finished processing bulk queue requests.",
     );
   }
 
@@ -260,7 +283,7 @@ export class EmailQueueService {
     emailId: string,
     region: string,
     transactional: boolean,
-    delay: number
+    delay: number,
   ) {
     if (!this.initialized) {
       await this.init();
@@ -282,7 +305,7 @@ export class EmailQueueService {
   public static async chancelEmail(
     emailId: string,
     region: string,
-    transactional: boolean
+    transactional: boolean,
   ) {
     if (!this.initialized) {
       await this.init();
@@ -307,17 +330,17 @@ export class EmailQueueService {
       this.initializeQueue(
         sesSetting.region,
         sesSetting.sesEmailRateLimit,
-        sesSetting.transactionalQuota
+        sesSetting.transactionalQuota,
       );
     }
     this.initialized = true;
   }
 }
 
-async function executeEmail(job: QueueEmailJob) {
+export async function executeEmail(job: QueueEmailJob) {
   logger.info(
     { emailId: job.data.emailId, elapsed: Date.now() - job.data.timestamp },
-    `[EmailQueueService]: Executing email job`
+    `[EmailQueueService]: Executing email job`,
   );
 
   const email = await db.email.findUnique({
@@ -333,103 +356,113 @@ async function executeEmail(job: QueueEmailJob) {
   if (!email) {
     logger.info(
       { emailId: job.data.emailId },
-      `[EmailQueueService]: Email not found, skipping`
+      `[EmailQueueService]: Email not found, skipping`,
     );
     return;
   }
 
-  const attachments: Array<EmailAttachment> = email.attachments
-    ? JSON.parse(email.attachments)
-    : [];
-
-  logger.info({ domain }, `Domain`);
-
-  const configurationSetName = await getConfigurationSetName(
-    domain?.clickTracking ?? false,
-    domain?.openTracking ?? false,
-    domain?.region ?? env.AWS_DEFAULT_REGION
-  );
-
-  if (!configurationSetName) {
+  // A redelivered/stalled job must not send an already accepted or cancelled email.
+  if (email.sesEmailId || !["QUEUED", "SCHEDULED"].includes(email.latestStatus))
     return;
-  }
+  let dispatchId: string | undefined;
+  let requestStarted = false;
+  try {
+    const attachments: Array<EmailAttachment> = email.attachments
+      ? JSON.parse(email.attachments)
+      : [];
 
-  logger.info({ emailId: email.id }, `[EmailQueueService]: Sending email`);
-  const unsubUrl = job.data.unsubUrl;
-  const isBulk = job.data.isBulk;
+    const configurationSetName = await getConfigurationSetName(
+      domain?.clickTracking ?? false,
+      domain?.openTracking ?? false,
+      domain?.region ?? env.AWS_DEFAULT_REGION,
+    );
 
-  const text = email.text
-    ? email.text
-    : email.campaignId && email.html
-      ? htmlToText(email.html)
-      : undefined;
-  let subject = email.subject;
+    if (!configurationSetName) {
+      throw new UnrecoverableError(
+        "SES configuration set is missing for the sending region",
+      );
+    }
 
-  if (email.campaignId && email.contactId && subject.includes("{{")) {
-    const contact = await db.contact.findUnique({
-      where: { id: email.contactId },
-      include: {
-        contactBook: {
-          select: { variables: true },
+    logger.info({ emailId: email.id }, `[EmailQueueService]: Sending email`);
+    const unsubUrl = job.data.unsubUrl;
+    const isBulk = job.data.isBulk;
+
+    const text = email.text
+      ? email.text
+      : email.campaignId && email.html
+        ? htmlToText(email.html)
+        : undefined;
+    let subject = email.subject;
+
+    if (email.campaignId && email.contactId && subject.includes("{{")) {
+      const contact = await db.contact.findUnique({
+        where: { id: email.contactId },
+        include: {
+          contactBook: {
+            select: { variables: true },
+          },
         },
-      },
-    });
+      });
 
-    if (contact) {
-      subject = replaceContactVariables(subject, contact, [
-        ...BUILT_IN_CONTACT_VARIABLES,
-        ...contact.contactBook.variables,
-      ]);
+      if (contact) {
+        subject = replaceContactVariables(subject, contact, [
+          ...BUILT_IN_CONTACT_VARIABLES,
+          ...contact.contactBook.variables,
+        ]);
 
-      if (subject !== email.subject) {
-        await db.email.update({
-          where: { id: email.id },
-          data: { subject },
-        });
+        if (subject !== email.subject) {
+          await db.email.update({
+            where: { id: email.id },
+            data: { subject },
+          });
+        }
       }
     }
-  }
 
-  let inReplyToMessageId: string | undefined = undefined;
+    let inReplyToMessageId: string | undefined = undefined;
 
-  if (email.inReplyToId) {
-    const replyEmail = await db.email.findUnique({
-      where: {
-        id: email.inReplyToId,
-      },
-    });
+    if (email.inReplyToId) {
+      const replyEmail = await db.email.findUnique({
+        where: {
+          id: email.inReplyToId,
+        },
+      });
 
-    if (replyEmail && replyEmail.sesEmailId) {
-      inReplyToMessageId = replyEmail.sesEmailId;
+      if (replyEmail && replyEmail.sesEmailId) {
+        inReplyToMessageId = replyEmail.sesEmailId;
+      }
     }
-  }
 
-  try {
     // Check limits right before sending (cloud-only)
     const limitCheck = await LimitService.checkEmailLimit(email.teamId);
     logger.info({ limitCheck }, `[EmailQueueService]: Limit check`);
     if (limitCheck.isLimitReached) {
-      await db.emailEvent.create({
-        data: {
-          emailId: email.id,
-          status: "FAILED",
-          data: {
-            error: "Email sending limit reached",
-            reason: limitCheck.reason,
-            limit: limitCheck.limit,
-          },
-          teamId: email.teamId,
-        },
-      });
-      await db.email.update({
-        where: { id: email.id },
-        data: { latestStatus: "FAILED" },
-      });
-      return;
+      throw new UnrecoverableError(
+        `Email sending limit reached: ${limitCheck.reason}`,
+      );
     }
 
     const customHeaders = email.headers ? JSON.parse(email.headers) : undefined;
 
+    const region = domain?.region ?? env.AWS_DEFAULT_REGION;
+    const setting = await db.sesSetting.findUnique({ where: { region } });
+    if (!setting)
+      throw new UnrecoverableError(
+        "SES settings are missing for the sending region",
+      );
+    const waitMs = await reserveSendBudget(
+      region,
+      setting.sesEmailRateLimit,
+      email.to.length + email.cc.length + email.bcc.length,
+    );
+    if (waitMs > 0) {
+      await job.moveToDelayed(Date.now() + waitMs + 25, job.token);
+      throw new DelayedError();
+    }
+    const dispatch = await claimDispatch(email.id);
+    if (!dispatch) return;
+    dispatchId = dispatch.id;
+    requestStarted = true;
     const messageId = await sendRawEmail({
       to: email.to,
       from: email.from,
@@ -450,9 +483,11 @@ async function executeEmail(job: QueueEmailJob) {
       headers: customHeaders,
     });
 
+    if (!messageId)
+      throw new Error("SES returned no message ID; delivery outcome unknown");
     logger.info(
       { emailId: email.id, sesEmailId: messageId },
-      `[EmailQueueService]: Email sent`
+      `[EmailQueueService]: Email sent`,
     );
 
     // Delete attachments and headers after sending the email
@@ -460,20 +495,108 @@ async function executeEmail(job: QueueEmailJob) {
       where: { id: email.id },
       data: { sesEmailId: messageId, text, attachments: null, headers: null },
     });
-  } catch (error: any) {
+    await db.emailEvent.update({
+      where: { id: dispatchId },
+      data: { data: { dispatchState: "accepted", sesEmailId: messageId } },
+    });
+  } catch (error: unknown) {
+    if (error instanceof DelayedError) throw error;
+    if (
+      !dispatchId &&
+      !(error instanceof UnrecoverableError) &&
+      !(error instanceof SyntaxError) &&
+      job.attemptsMade + 1 < SEND_ATTEMPTS
+    )
+      throw error;
+    if (dispatchId && isExplicitSesThrottle(error)) {
+      await db.emailEvent.update({
+        where: { id: dispatchId },
+        data: {
+          data: {
+            dispatchState: "rejected",
+            reason: "SES throttled the request",
+          },
+        },
+      });
+      if (job.attemptsMade + 1 < SEND_ATTEMPTS) throw error;
+    }
+    const httpStatus = (error as { $metadata?: { httpStatusCode?: number } })
+      ?.$metadata?.httpStatusCode;
+    const rejectedBySes =
+      requestStarted &&
+      httpStatus !== undefined &&
+      httpStatus >= 400 &&
+      httpStatus < 500;
+    if (dispatchId && rejectedBySes && !isExplicitSesThrottle(error)) {
+      await db.emailEvent.update({
+        where: { id: dispatchId },
+        data: {
+          data: {
+            dispatchState: "rejected",
+            reason:
+              error instanceof Error
+                ? error.message
+                : "SES rejected the request",
+          },
+        },
+      });
+    }
+    const reason =
+      requestStarted && !rejectedBySes
+        ? "Send did not complete cleanly; reconcile SES events before resending (delivery outcome may be unknown)"
+        : error instanceof Error
+          ? error.message
+          : "Email dispatch failed";
+    logger.error(
+      { err: error, emailId: email.id },
+      "Email dispatch requires attention",
+    );
     await db.emailEvent.create({
       data: {
         emailId: email.id,
         status: "FAILED",
         data: {
-          error: error.toString(),
+          error: reason,
         },
         teamId: email.teamId,
       },
     });
-    await db.email.update({
-      where: { id: email.id },
+    // A concurrent SES callback is stronger evidence than a local error.
+    const failed = await db.email.updateMany({
+      where: {
+        id: email.id,
+        sesEmailId: null,
+        latestStatus: { in: ["QUEUED", "SCHEDULED"] },
+      },
       data: { latestStatus: "FAILED" },
     });
+    if (failed.count) {
+      let dispatchKey: string | undefined;
+      try {
+        dispatchKey = email.headers
+          ? JSON.parse(email.headers)["X-Anthem-Dispatch-Key"]
+          : undefined;
+      } catch {
+        /* Invalid headers are already recorded as a dispatch failure. */
+      }
+      await WebhookService.emit(
+        email.teamId,
+        "email.failed",
+        {
+          id: email.id,
+          status: "FAILED",
+          from: email.from,
+          to: email.to,
+          subject: email.subject,
+          occurredAt: new Date().toISOString(),
+          failed: { reason },
+          ...(dispatchKey && /^[a-f0-9]{64}$/.test(dispatchKey)
+            ? { metadata: { anthemDispatchKey: dispatchKey } }
+            : {}),
+        },
+        { domainId: email.domainId },
+      );
+    }
+    throw new UnrecoverableError(reason);
   }
 }
